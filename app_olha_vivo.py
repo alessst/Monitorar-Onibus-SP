@@ -894,7 +894,6 @@ def pagina_perto():
         st.error(f"⚠️ {e}")
     st.caption(f"Malha viária: GTFS SPTrans ({G['origem']}) • Telemetria: API Olho Vivo.")
 
-
 # ======================= ABA: LINHAS =======================
 def pagina_linhas():
     termo_linha = st.text_input(
@@ -931,8 +930,9 @@ def pagina_linhas():
         letreiro = f"{linha['lt']}-{linha['tl']}"
         cor = cor_da_linha(letreiro)
         destino = destino_da_linha(linha)
+        direcao_gtfs = 2 - linha["sl"]  # sl=1 -> dir=1 | sl=2 -> dir=0
 
-        paradas = api_paradas_da_linha(cl)
+        paradas_api = api_paradas_da_linha(cl)
         posicao = api_posicao_linha(cl)
         previsao = api_previsao_linha(cl)
         onibus = posicao.get("vs") or []
@@ -943,6 +943,50 @@ def pagina_linhas():
         if G:
             trajeto = gtfs_data.trajeto_da_linha(G, letreiro, linha["sl"], destino)
 
+        # --- Une as paradas da API com TODAS as paradas de rua do GTFS desta linha ---
+        mapa_paradas = {p["cp"]: p for p in (paradas_api or [])}
+        if G:
+            # Procura em possíveis estruturas do dicionário G onde ficam as paradas
+            colecoes_stops = []
+            for k, val in G.items():
+                if isinstance(val, list) and val and isinstance(val[0], dict) and "cp" in val[0] and "linhas" in val[0]:
+                    colecoes_stops.append(val)
+                elif isinstance(val, dict):
+                    amostra = next(iter(val.values()), None)
+                    if isinstance(amostra, dict) and "cp" in amostra and "linhas" in amostra:
+                        colecoes_stops.append(val.values())
+
+            for lista_s in colecoes_stops:
+                for s in lista_s:
+                    linhas_s = s.get("linhas") or []
+                    if (letreiro, direcao_gtfs) in linhas_s or any(x[0] == letreiro for x in linhas_s):
+                        cp_s = s["cp"]
+                        if cp_s not in mapa_paradas:
+                            mapa_paradas[cp_s] = {
+                                "cp": cp_s,
+                                "np": s.get("nome") or s.get("np") or f"Parada {cp_s}",
+                                "ed": s.get("desc") or s.get("ed") or "",
+                                "py": s.get("lat") or s.get("py"),
+                                "px": s.get("lon") or s.get("px"),
+                            }
+
+            # Garantia extra: inclui paradas próximas a até 2km de você que atendam esta linha
+            if user_pos:
+                for p_prox in gtfs_data.paradas_proximas(G, user_pos[0], user_pos[1], 2000, limite=80):
+                    linhas_p = p_prox.get("linhas") or []
+                    if (letreiro, direcao_gtfs) in linhas_p or any(x[0] == letreiro for x in linhas_p):
+                        cp_s = p_prox["cp"]
+                        if cp_s not in mapa_paradas:
+                            mapa_paradas[cp_s] = {
+                                "cp": cp_s,
+                                "np": p_prox["nome"],
+                                "ed": p_prox.get("desc") or "",
+                                "py": p_prox["lat"],
+                                "px": p_prox["lon"],
+                            }
+
+        paradas = list(mapa_paradas.values())
+
         card(
             f'<div class="card"><div class="row"><div>{badge(letreiro)}'
             f'<span class="card-title">Sentido {h(destino)}</span>'
@@ -952,16 +996,14 @@ def pagina_linhas():
         if not onibus:
             st.warning("Nenhum veículo desta linha transmitindo sinal GPS neste instante.")
 
-
-        # --- Ponto de embarque (ordenado do mais próximo para o mais longe) ---
+        # --- Ponto de embarque (ordenado do mais próximo para o mais distante) ---
         ponto = None
         if paradas:
             if user_pos:
-                paradas = sorted(
-                    paradas,
-                    key=lambda p: distancia_km(user_pos[0], user_pos[1], p["py"], p["px"]),
+                paradas.sort(
+                    key=lambda p: distancia_km(user_pos[0], user_pos[1], p["py"], p["px"])
                 )
-                pos_key = f"{user_pos[0]:.3f}_{user_pos[1]:.3f}"
+                pos_key = f"{user_pos[0]:.4f}_{user_pos[1]:.4f}"
             else:
                 pos_key = "noloc"
 
@@ -978,15 +1020,29 @@ def pagina_linhas():
                 index=0,
                 format_func=fmt_parada,
                 key=f"ponto_{cl}_{pos_key}",
-                help="As paradas estão ordenadas da mais próxima para a mais distante de você." if user_pos else None,
+                help="Mostrando todas as paradas da linha ordenadas da mais próxima para a mais distante de você." if user_pos else None,
             )
 
         chegadas = []
         if ponto:
+            # 1) Tenta pegar da previsão geral da linha
             for p in previsao.get("ps") or []:
                 if p["cp"] == ponto["cp"]:
                     chegadas = sorted(p.get("vs") or [], key=lambda v: v["t"])
                     break
+            # 2) Se for parada comum de rua (fora de corredor), busca a previsão direta da parada
+            if not chegadas:
+                try:
+                    hr_p, ls_p = previsao_da_parada(ponto["cp"])
+                    if hr_p:
+                        hora_ref = hr_p
+                    for l_p in ls_p:
+                        if l_p.get("cl") == cl or l_p.get("c") == letreiro:
+                            chegadas = sorted(l_p.get("vs") or [], key=lambda v: v["t"])
+                            break
+                except SPTransError:
+                    pass
+
             caminhada = ""
             if user_pos:
                 caminhada = chip_caminhada(distancia_km(user_pos[0], user_pos[1], ponto["py"], ponto["px"]) * 1000)
@@ -1019,12 +1075,12 @@ def pagina_linhas():
             for i, p in enumerate(paradas):
                 if ponto and p["cp"] == ponto["cp"]:
                     continue
-                ponta = i in (0, len(paradas) - 1)
+                ponta = i in (0, len(paradas) - 1) and not user_pos
                 folium.CircleMarker(
                     (p["py"], p["px"]), radius=7 if ponta else 4,
                     color="#0F172A" if ponta else cor, weight=2, fill=True,
                     fill_color="#10B981" if i == 0 and ponta else "#EF4444" if ponta else "#fff", fill_opacity=1,
-                    tooltip=("Início • " if i == 0 else "Fim • " if ponta else "") + p["np"],
+                    tooltip=p["np"],
                 ).add_to(mapa)
 
             foco_ponto = []
@@ -1054,7 +1110,6 @@ def pagina_linhas():
                        + ("" if trajeto else " (Trajeto esquemático entre paradas.)"))
     except SPTransError as e:
         st.error(f"⚠️ {e}")
-
 
 # ======================= ABA: PARADAS =======================
 def pagina_paradas():
