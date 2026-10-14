@@ -413,14 +413,14 @@ def chip_caminhada(metros: float) -> str:
 
 
 def mapa_base(centro) -> folium.Map:
-    # CartoDB Voyager oferece um visual muito mais limpo e moderno que o OpenStreetMap padrão
-    return folium.Map(
-        location=centro,
-        zoom_start=15,
-        tiles="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
-        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
-        zoom_control=True,
+    m = folium.Map(location=centro, zoom_start=15, tiles="OpenStreetMap", zoom_control=True)
+    # Suaviza as cores do OpenStreetMap para destacar os ônibus e trajetos, sem precisar de API Key!
+    m.get_root().header.add_child(
+        folium.Element(
+            "<style>.leaflet-tile-pane { filter: saturate(0.55) contrast(1.03) brightness(1.03); }</style>"
+        )
     )
+    return m
 
 
 def icone_onibus(cor: str) -> folium.DivIcon:
@@ -951,6 +951,7 @@ def pagina_linhas():
         )
         if not onibus:
             st.warning("Nenhum veículo desta linha transmitindo sinal GPS neste instante.")
+
 
         # --- Ponto de embarque (ordenado do mais próximo para o mais longe) ---
         ponto = None
