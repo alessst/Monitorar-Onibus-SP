@@ -594,7 +594,7 @@ JS_GPS = (
     "navigator.geolocation.getCurrentPosition("
     "function(p){resolve({coords:{latitude:p.coords.latitude,longitude:p.coords.longitude,accuracy:p.coords.accuracy}});},"
     "function(e){resolve({error:{code:e.code,message:e.message}});},"
-    "{enableHighAccuracy:false,timeout:15000,maximumAge:300000});"
+    "{enableHighAccuracy:true,timeout:20000,maximumAge:15000});"
     "});})()"
 )
 
@@ -649,6 +649,7 @@ if isinstance(res_gps, dict):
     coords = res_gps.get("coords") or {}
     if coords.get("latitude") is not None and coords.get("longitude") is not None:
         st.session_state["pos_gps"] = (coords["latitude"], coords["longitude"])
+        st.session_state["gps_acc"] = coords.get("accuracy")
         st.session_state.pop("gps_erro", None)
     elif res_gps.get("error"):
         st.session_state["gps_erro"] = res_gps["error"].get("code", 2)
@@ -703,7 +704,9 @@ if _payload["lembrar"] is False or "lat" in _payload:
 with col_status:
     if user_pos:
         classe = "green" if origem_pos != "Posição salva" else "gray"
-        st.markdown(f'<span class="chip {classe}">📍 {origem_pos}</span>', unsafe_allow_html=True)
+        acc = st.session_state.get("gps_acc")
+        acc_txt = f" (±{acc:.0f}m)" if acc and origem_pos == "GPS ativo" else ""
+        st.markdown(f'<span class="chip {classe}">📍 {origem_pos}{acc_txt}</span>', unsafe_allow_html=True)
     elif st.session_state.get("gps_erro") is not None:
         st.markdown('<span class="chip">📍 Sem localização</span>', unsafe_allow_html=True)
     else:
@@ -808,10 +811,13 @@ def pagina_perto():
 
     raio = st.select_slider("Raio de busca", options=[200, 300, 500, 800, 1000], value=500,
                             format_func=lambda m: f"{m} m", key="raio")
-    proximas = gtfs_data.paradas_proximas(G, user_pos[0], user_pos[1], raio, limite=15)
+    proximas = gtfs_data.paradas_proximas(G, user_pos[0], user_pos[1], raio, limite=25)
     if not proximas:
         st.info("Nenhum ponto de ônibus encontrado nesse raio. Aumente a distância acima.")
         return
+
+    # Garante que os pontos estão rigorosamente do mais perto para o mais longe
+    proximas.sort(key=lambda p: p["dist_m"])
 
     melhor = {}
     for p in proximas:
@@ -946,19 +952,32 @@ def pagina_linhas():
         if not onibus:
             st.warning("Nenhum veículo desta linha transmitindo sinal GPS neste instante.")
 
-        # --- Ponto de embarque ---
+        # --- Ponto de embarque (ordenado do mais próximo para o mais longe) ---
         ponto = None
         if paradas:
-            idx_padrao = 0
             if user_pos:
-                idx_padrao = min(
-                    range(len(paradas)),
-                    key=lambda i: distancia_km(user_pos[0], user_pos[1], paradas[i]["py"], paradas[i]["px"]),
+                paradas = sorted(
+                    paradas,
+                    key=lambda p: distancia_km(user_pos[0], user_pos[1], p["py"], p["px"]),
                 )
+                pos_key = f"{user_pos[0]:.3f}_{user_pos[1]:.3f}"
+            else:
+                pos_key = "noloc"
+
+            def fmt_parada(p: dict) -> str:
+                base = rotulo_parada(p)
+                if user_pos:
+                    d_m = distancia_km(user_pos[0], user_pos[1], p["py"], p["px"]) * 1000
+                    return f"📍 {dist_txt(d_m)} • {base}"
+                return base
+
             ponto = st.selectbox(
-                "Ponto de embarque", paradas, index=idx_padrao, format_func=rotulo_parada,
-                key=f"ponto_{cl}_{'loc' if user_pos else 'noloc'}",
-                help="Selecionamos automaticamente a parada mais próxima da sua localização." if user_pos else None,
+                "Ponto de embarque",
+                paradas,
+                index=0,
+                format_func=fmt_parada,
+                key=f"ponto_{cl}_{pos_key}",
+                help="As paradas estão ordenadas da mais próxima para a mais distante de você." if user_pos else None,
             )
 
         chegadas = []
