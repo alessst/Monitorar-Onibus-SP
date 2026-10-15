@@ -2,12 +2,12 @@ import colorsys
 import html
 import json
 import os
+import time
 
 import folium
 import requests
 import streamlit as st
 from folium.plugins import PolyLineTextPath
-from streamlit_autorefresh import st_autorefresh
 from streamlit_folium import st_folium
 from streamlit_js_eval import streamlit_js_eval
 
@@ -22,7 +22,6 @@ from sptrans import (
 
 # ======================= CONFIGURAÇÃO =======================
 st.set_page_config(page_title="Olho Vivo • Ônibus SP", page_icon="🚌", layout="centered")
-st_autorefresh(interval=30000, limit=200, key="atualizacao_onibus")
 
 COR_MARCA = "#F26B21"
 
@@ -366,7 +365,6 @@ def card(conteudo: str) -> None:
 
 
 def norm_letreiro(cod: str) -> str:
-    """Normaliza '8000-10' e '8000' para comparar GTFS com API sem falhas."""
     return str(cod or "").strip().upper()
 
 
@@ -412,9 +410,9 @@ def mapa_base(centro, zoom: int = 16) -> folium.Map:
     return m
 
 
-def icone_onibus(cor: str) -> folium.DivIcon:
+def icone_onibus(cor: str, prefixo: str = "") -> folium.DivIcon:
     svg_bus = (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" '
+        '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" '
         'fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
         '<path d="M8 6v6"/><path d="M15 6v6"/><path d="M2 12h19.6"/>'
         '<path d="M18 18h3s.5-1.7.8-2.8c.1-.4.2-.8.2-1.2 0-.4-.1-.8-.2-1.2l-1.4-5C20.1 6.8 19.1 6 18 6H4a2 2 0 0 0-2 2v10h3"/>'
@@ -425,7 +423,7 @@ def icone_onibus(cor: str) -> folium.DivIcon:
         icon_anchor=(17, 17),
         html=(f'<div style="background:{cor};border:2.5px solid #fff;border-radius:50%;width:34px;height:34px;'
               'display:flex;align-items:center;justify-content:center;'
-              'box-shadow:0 4px 10px rgba(15,23,42,.35)">'
+              'box-shadow:0 4px 10px rgba(15,23,42,.38)">'
               f'{svg_bus}</div>'),
     )
 
@@ -474,12 +472,6 @@ def icone_destino() -> folium.DivIcon:
     )
 
 
-def desenhar_mapa(mapa: folium.Map, pontos_foco: list, key: str, altura: int = 340) -> None:
-    if len(pontos_foco) > 1:
-        mapa.fit_bounds(pontos_foco, padding=(38, 38), max_zoom=17)
-    st_folium(mapa, height=altura, use_container_width=True, returned_objects=[], key=key)
-
-
 def desenhar_trajeto(mapa: folium.Map, pontos: list, cor: str) -> None:
     folium.PolyLine(pontos, color="#FFFFFF", weight=9, opacity=0.95).add_to(mapa)
     linha = folium.PolyLine(pontos, color=cor, weight=5, opacity=0.95).add_to(mapa)
@@ -489,7 +481,7 @@ def desenhar_trajeto(mapa: folium.Map, pontos: list, cor: str) -> None:
     ).add_to(mapa)
 
 
-# ======================= API (com cache) =======================
+# ======================= API (com cache enxuto para tempo real) =======================
 def _token() -> str | None:
     try:
         if "SPTRANS_TOKEN" in st.secrets:
@@ -518,17 +510,12 @@ def api_buscar_linhas(termo):
     return cliente().buscar_linhas(termo)
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def api_posicao_linha(cl):
     return cliente().posicao_linha(cl)
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def api_previsao_linha(cl):
-    return cliente().previsao_linha(cl)
-
-
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def api_previsao_parada(cp):
     return cliente().previsao_parada(cp)
 
@@ -570,17 +557,17 @@ def previsao_da_parada(cp) -> tuple[str | None, list]:
     return dados.get("hr"), (dados.get("p") or {}).get("l") or []
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def obter_dados_tempo_real_linha(rota: str, sl: int, lat_parada: float, lon_parada: float):
     """
-    Busca a frota em tempo real de uma linha e calcula a estimativa de chegada (ETA)
-    para paradas comuns de rua que a API PrevisaoParada da SPTrans não cobre.
+    Busca a frota em tempo real de uma linha (atualiza a cada 10s) e calcula
+    os minutos estimados para paradas comuns de rua.
     """
     try:
         termo = letreiro_base(rota)
         linhas = api_buscar_linhas(termo)
         if not linhas:
-            return [], [], None
+            return [], [], None, ""
         alvo = norm_letreiro(rota)
         linha = next(
             (l for l in linhas if f"{l['lt']}-{l['tl']}".upper() == alvo and l["sl"] == sl),
@@ -589,30 +576,28 @@ def obter_dados_tempo_real_linha(rota: str, sl: int, lat_parada: float, lon_para
         cl = linha["cl"]
         pos = api_posicao_linha(cl)
         vs = pos.get("vs") or []
+        hr = pos.get("hr") or ""
         if not vs:
-            return [], [], cl
+            return [], [], cl, hr
 
-        # Calcula a distância de cada veículo ativo até a parada do usuário
-        # Velocidade média urbana de ônibus em SP (~17 km/h -> ~280 metros/minuto)
         mins_estimados = []
         for v in vs:
             d_km = distancia_km(lat_parada, lon_parada, v["py"], v["px"])
-            # Considera ônibus num raio de até 12 km da parada
             if d_km <= 12.0:
-                m_est = max(1, round((d_km * 1.25) / 0.28))  # 1.25 compensa curvas de rua
+                m_est = max(1, round((d_km * 1.25) / 0.28))
                 mins_estimados.append(m_est)
         mins_estimados.sort()
-        return mins_estimados[:3], vs, cl
+        return mins_estimados[:3], vs, cl, hr
     except Exception:
-        return [], [], None
+        return [], [], None, ""
 
 
 # ======================= ESTADO & LOCALIZAÇÃO =======================
 st.session_state.setdefault("lembrar", True)
 st.session_state.setdefault("gps_n", 0)
-st.session_state.setdefault("raio", 100)  # Padrão 100m
+st.session_state.setdefault("raio", 100)
 st.session_state.setdefault("raio_destino", 700)
-st.session_state.setdefault("linha_mapa", None)  # (rota, direcao, cp_embarque) selecionada para ver no mapa principal
+st.session_state.setdefault("linha_mapa", None)
 
 
 def _novo_gps():
@@ -683,7 +668,7 @@ if "prefs_carregadas" not in st.session_state:
             pass
         st.session_state["prefs_carregadas"] = True
 
-# 2) Solicita GPS de alta precisão
+# 2) Solicita GPS apenas quando necessário (sem ser interrompido por refresh de página inteira!)
 res_gps = streamlit_js_eval(js_expressions=JS_GPS, key=f"gps_{st.session_state['gps_n']}")
 if isinstance(res_gps, dict):
     coords = res_gps.get("coords") or {}
@@ -738,7 +723,6 @@ elif "pos_salva" in st.session_state:
 else:
     user_pos, origem_pos = None, None
 
-# Salva preferências no navegador
 _pos_para_salvar = st.session_state.get("pos_gps") or st.session_state.get("pos_salva")
 _payload = {"lembrar": bool(st.session_state["lembrar"]), "raio": int(st.session_state["raio"])}
 if st.session_state["lembrar"] and _pos_para_salvar:
@@ -764,6 +748,247 @@ with col_status:
         st.markdown('<span class="muted">⏳ Obtendo localização...</span>', unsafe_allow_html=True)
 
 
+# ======================= FRAGMENTO ISOLADO: MAPA + TELEMETRIA (ATUALIZA SOZINHO) =======================
+@st.fragment(run_every="15s")
+def bloco_tempo_real(G, proximas, paradas_ativas, mapa_cp_parada, cp_selecionado, dest_pos, dest_nome, linhas_destino_map):
+    """
+    Este bloco roda de forma independente a cada 15 segundos!
+    Ele atualiza a posição dos ônibus no mapa e os minutos de chegada sem mexer no resto da página.
+    """
+    raio_atual = st.session_state["raio"]
+    melhor_parada_por_linha = {}
+    for p in paradas_ativas:
+        for chave in p["linhas"]:
+            if dest_pos and chave not in linhas_destino_map:
+                continue
+            melhor_parada_por_linha.setdefault(chave, p)
+
+    # 1) Busca previsões oficiais da parada (corredores/terminais)
+    etas_oficiais = {}
+    etas_base = {}
+    hora_servidor = ""
+    try:
+        for p in paradas_ativas[:6]:
+            hr, ls = previsao_da_parada(p["cp"])
+            if hr:
+                hora_servidor = hr
+            for l in ls:
+                vs = sorted(l.get("vs") or [], key=lambda v: v["t"])
+                if hr and vs:
+                    mins_l = [minutos_ate(hr, v["t"]) for v in vs]
+                    c_norm = norm_letreiro(l.get("c"))
+                    c_base = letreiro_base(c_norm)
+                    sl_l = l.get("sl")
+                    etas_oficiais[(p["cp"], c_norm, sl_l)] = mins_l
+                    etas_base[(p["cp"], c_base, sl_l)] = mins_l
+    except SPTransError:
+        pass
+
+    # 2) Busca GPS em tempo real das linhas visíveis (para paradas de calçada e mapa)
+    dados_linhas = {}
+    candidatas = list(melhor_parada_por_linha.items())
+    if dest_pos:
+        candidatas.sort(key=lambda kv: (linhas_destino_map[kv[0]]["dist_m"], kv[1]["dist_m"]))
+    else:
+        candidatas.sort(key=lambda kv: (kv[1]["dist_m"], kv[0][0]))
+
+    for (rota, direcao), p in candidatas[:12]:
+        sl = 2 - direcao
+        r_norm = norm_letreiro(rota)
+        r_base = letreiro_base(rota)
+        mins = etas_oficiais.get((p["cp"], r_norm, sl)) or etas_base.get((p["cp"], r_base, sl))
+        mins_est, vs_linha, _, hr_pos = obter_dados_tempo_real_linha(rota, sl, p["lat"], p["lon"])
+        if hr_pos and not hora_servidor:
+            hora_servidor = hr_pos
+        if mins:
+            dados_linhas[(rota, direcao)] = {"mins": mins, "estimado": False, "vs": vs_linha}
+        else:
+            dados_linhas[(rota, direcao)] = {"mins": mins_est, "estimado": True, "vs": vs_linha}
+
+    # 3) Renderiza o Mapa (usando FeatureGroup dinâmico para atualizar os ônibus sem travar!)
+    linha_ativa_mapa = st.session_state.get("linha_mapa")
+    if linha_ativa_mapa and (linha_ativa_mapa[0], linha_ativa_mapa[1]) not in melhor_parada_por_linha:
+        linha_ativa_mapa = None
+        st.session_state["linha_mapa"] = None
+
+    mapa = mapa_base(user_pos)
+    camada_dinamica = folium.FeatureGroup(name="Telemetria")
+    foco_mapa = [user_pos]
+    qtd_onibus_mapa = 0
+
+    if linha_ativa_mapa:
+        rota_sel, dir_sel, _ = linha_ativa_mapa
+        sl_sel = 2 - dir_sel
+        cor_sel = cor_da_linha(rota_sel)
+        dest_str = G["destino"].get((rota_sel, dir_sel), "")
+        p_emb = melhor_parada_por_linha[(rota_sel, dir_sel)]
+
+        trajeto = gtfs_data.trajeto_da_linha(G, rota_sel, sl_sel, dest_str)
+        if trajeto:
+            desenhar_trajeto(mapa, trajeto, cor_sel)
+
+        # Parada de embarque (verde)
+        folium.Marker(
+            (p_emb["lat"], p_emb["lon"]),
+            icon=icone_parada(cor_bg="#059669"),
+            tooltip=f"🟢 Embarque: {p_emb['nome']} ({dist_txt(p_emb['dist_m'])} de você)",
+        ).add_to(camada_dinamica)
+        folium.PolyLine([user_pos, (p_emb["lat"], p_emb["lon"])], color="#2563EB", weight=3, dash_array="4 6").add_to(camada_dinamica)
+        foco_mapa.append((p_emb["lat"], p_emb["lon"]))
+
+        # Parada de desembarque (se filtrou endereço de destino)
+        if dest_pos and (rota_sel, dir_sel) in linhas_destino_map:
+            p_desc = linhas_destino_map[(rota_sel, dir_sel)]
+            folium.Marker(
+                (p_desc["lat"], p_desc["lon"]),
+                icon=icone_parada(cor_bg="#0F172A"),
+                tooltip=f"🏁 Descer em: {p_desc['nome']} ({dist_txt(p_desc['dist_m'])} do destino)",
+            ).add_to(camada_dinamica)
+            folium.PolyLine([dest_pos, (p_desc["lat"], p_desc["lon"])], color="#EF4444", weight=3, dash_array="4 6").add_to(camada_dinamica)
+            foco_mapa.extend([dest_pos, (p_desc["lat"], p_desc["lon"])])
+
+        # Ônibus ao vivo da linha selecionada
+        info_rt = dados_linhas.get((rota_sel, dir_sel)) or {}
+        vs_ativos = info_rt.get("vs")
+        if vs_ativos is None:
+            _, vs_ativos, _, _ = obter_dados_tempo_real_linha(rota_sel, sl_sel, p_emb["lat"], p_emb["lon"])
+        qtd_onibus_mapa = len(vs_ativos or [])
+        for v in (vs_ativos or []):
+            folium.Marker(
+                (v["py"], v["px"]),
+                icon=icone_onibus(cor_sel, str(v.get("p", ""))),
+                tooltip=f"🚌 Linha {rota_sel} • Prefixo {v['p']} • GPS: {hora_local(v.get('ta'))}",
+            ).add_to(camada_dinamica)
+            if not dest_pos:
+                foco_mapa.append((v["py"], v["px"]))
+
+        if not dest_pos and trajeto:
+            foco_mapa.extend(trajeto[::max(1, len(trajeto) // 10)])
+    else:
+        # Modo Radar Próximo
+        folium.Circle(user_pos, radius=raio_atual, color=COR_MARCA, weight=1.5, fill=True, fill_opacity=0.06, dash_array="6").add_to(camada_dinamica)
+        for p in proximas:
+            selecionada = (cp_selecionado == p["cp"])
+            if selecionada or len(proximas) <= 5:
+                folium.Marker(
+                    (p["lat"], p["lon"]),
+                    icon=icone_parada(cor_bg="#0F172A" if selecionada else COR_MARCA),
+                    tooltip=f"{p['nome']} ({dist_txt(p['dist_m'])})",
+                ).add_to(camada_dinamica)
+            else:
+                folium.CircleMarker(
+                    (p["lat"], p["lon"]), radius=7, color="#fff", weight=2,
+                    fill=True, fill_color=COR_MARCA, fill_opacity=1,
+                    tooltip=f"{p['nome']} ({dist_txt(p['dist_m'])})",
+                ).add_to(camada_dinamica)
+            if cp_selecionado is None or selecionada:
+                foco_mapa.append((p["lat"], p["lon"]))
+
+    folium.Marker(user_pos, icon=icone_usuario(), tooltip="Você está aqui").add_to(camada_dinamica)
+    if dest_pos:
+        folium.Marker(dest_pos, icon=icone_destino(), tooltip=f"Destino: {dest_nome}").add_to(camada_dinamica)
+        foco_mapa.append(dest_pos)
+
+    camada_dinamica.add_to(mapa)
+    if len(foco_mapa) > 1:
+        mapa.fit_bounds(foco_mapa, padding=(38, 38), max_zoom=17)
+
+    # Barra superior do mapa com status da rota e botão de atualização instantânea do fragmento
+    hora_atual_str = hora_servidor or time.strftime("%H:%M:%S")
+    if linha_ativa_mapa:
+        c_m1, c_m2, c_m3 = st.columns([3.2, 1.2, 1.2], vertical_alignment="center")
+        with c_m1:
+            st.caption(f"🗺️ Rota **{linha_ativa_mapa[0]}** • **{qtd_onibus_mapa} ônibus** no GPS ({hora_atual_str})")
+        with c_m2:
+            if st.button("🔄 GPS", key="btn_refresh_frag", use_container_width=True, help="Atualizar posição dos ônibus agora"):
+                api_posicao_linha.clear()
+                obter_dados_tempo_real_linha.clear()
+        with c_m3:
+            if st.button("✖ Fechar", key="btn_fechar_rota", use_container_width=True):
+                st.session_state["linha_mapa"] = None
+                st.rerun()
+    else:
+        c_r1, c_r2 = st.columns([4.0, 1.4], vertical_alignment="center")
+        with c_r1:
+            st.caption(f"📡 Radar atualizando sozinho a cada 15s (última: {hora_atual_str})")
+        with c_r2:
+            if st.button("🔄 Atualizar", key="btn_refresh_radar", use_container_width=True):
+                api_posicao_linha.clear()
+                obter_dados_tempo_real_linha.clear()
+
+    # A key inclui o estado da linha ativa para garantir redesenho imediato da rota ao clicar em "Ver rota"
+    st_folium(
+        mapa,
+        height=330,
+        use_container_width=True,
+        returned_objects=[],
+        key=f"mapa_rt_{cp_selecionado}_{raio_atual}_{bool(dest_pos)}_{linha_ativa_mapa}",
+    )
+
+    # 4) Lista ordenada de ônibus abaixo do mapa
+    def _ordem_final(item):
+        (rota, direcao), p = item
+        info = dados_linhas.get((rota, direcao)) or {}
+        mins = info.get("mins") or []
+        eta_p = mins[0] if mins else 999
+        if dest_pos and (rota, direcao) in linhas_destino_map:
+            dist_dest = linhas_destino_map[(rota, direcao)]["dist_m"]
+            return (0 if mins else 1, dist_dest, eta_p, p["dist_m"])
+        return (eta_p, p["dist_m"], rota)
+
+    linhas_ordenadas = sorted(candidatas, key=_ordem_final)
+
+    titulo_sec = (
+        f"🚌 Ônibus para {dest_nome} ({len(linhas_ordenadas)})"
+        if dest_pos
+        else f"🚌 Ônibus em {mapa_cp_parada[cp_selecionado]['nome']}"
+        if cp_selecionado in mapa_cp_parada
+        else f"🚌 Linhas próximas ({len(linhas_ordenadas)})"
+    )
+    st.markdown(f'<div class="sec"><span>{h(titulo_sec)}</span><span>Previsão</span></div>', unsafe_allow_html=True)
+
+    for (rota, direcao), p in linhas_ordenadas[:15]:
+        info = dados_linhas.get((rota, direcao)) or {}
+        mins = info.get("mins") or []
+        estimado = info.get("estimado", False)
+        eta_html = texto_eta(mins[0], mins[1:], estimado=estimado) if mins else texto_eta(None)
+        destino_letreiro = h(G["destino"].get((rota, direcao), "Terminal"))
+
+        esta_no_mapa = bool(linha_ativa_mapa and linha_ativa_mapa[0] == rota and linha_ativa_mapa[1] == direcao)
+        cls_selecionado = "selected" if esta_no_mapa else ""
+
+        info_desembarque = ""
+        if dest_pos and (rota, direcao) in linhas_destino_map:
+            p_desc = linhas_destino_map[(rota, direcao)]
+            info_desembarque = (
+                f'<div class="card-sub" style="margin-top:4px;color:#059669">'
+                f'🏁 <b>Descer a {dist_txt(p_desc["dist_m"])} do destino:</b> {h(p_desc["nome"])}</div>'
+            )
+
+        status_live = '<span class="live"></span>' if mins else ""
+        col_card, col_btn = st.columns([4.5, 1.3], vertical_alignment="center")
+        with col_card:
+            card(
+                f'<div class="card compact interactive {cls_selecionado}"><div class="row"><div>'
+                f'{badge(rota)}<span class="card-title" style="font-size:0.91rem">➜ {destino_letreiro}</span>'
+                f'<div class="card-sub" style="margin-top:5px">{status_live}🟢 <b>Embarque ({dist_txt(p["dist_m"])}):</b> {h(p["nome"])}</div>'
+                f'{info_desembarque}'
+                f'</div>{eta_html}</div></div>'
+            )
+        with col_btn:
+            rotulo_btn = "✅ No mapa" if esta_no_mapa else "👁️ Ver rota"
+            tipo_btn = "primary" if esta_no_mapa else "secondary"
+            if st.button(
+                rotulo_btn,
+                key=f"btn_rota_{rota}_{direcao}_{p['cp']}",
+                type=tipo_btn,
+                help="Desenha a rota deste ônibus no mapa acima sem recarregar a página!",
+                use_container_width=True,
+            ):
+                alternar_linha_no_mapa(rota, direcao, p["cp"])
+                st.rerun(scope="fragment")
+
+
 # ======================= PAINEL UNIFICADO PRINCIPAL =======================
 def painel_principal():
     if not user_pos:
@@ -787,7 +1012,7 @@ def painel_principal():
         st.error(f"Não foi possível carregar a base GTFS: {st.session_state.get('gtfs_erro')}")
         return
 
-    # ---------------- 1. BARRA "PARA ONDE VOCÊ VAI?" ----------------
+    # ---------------- 1. BARRA "PARA ONDE VOCÊ VAI?" (ESTÁTICA FORA DO FRAGMENTO) ----------------
     c_in, c_btn = st.columns([3.8, 1.2], vertical_alignment="center")
     with c_in:
         dest_query = st.text_input(
@@ -815,8 +1040,7 @@ def painel_principal():
     dest_pos = st.session_state.get("dest_pos")
     dest_nome = st.session_state.get("dest_nome")
 
-    # Mapa de linhas que passam perto do destino -> guarda a parada MAIS PRÓXIMA do endereço pesquisado
-    linhas_destino_map = {}  # (letreiro, direcao) -> parada_desembarque
+    linhas_destino_map = {}
     if dest_pos:
         p_dest_lista = gtfs_data.paradas_proximas(G, dest_pos[0], dest_pos[1], st.session_state["raio_destino"], limite=80)
         p_dest_lista.sort(key=lambda x: x["dist_m"])
@@ -878,7 +1102,7 @@ def painel_principal():
             return
         proximas = proximas_filtradas
 
-    # ---------------- 3. SELETOR DE PARADA (FILTRA PARADA -> FILTRA ÔNIBUS) ----------------
+    # ---------------- 3. SELETOR DE PARADA (ESTÁTICO FORA DO FRAGMENTO) ----------------
     st.markdown('<div class="sec"><span>🚏 Filtrar por parada próxima</span></div>', unsafe_allow_html=True)
 
     opcoes_parada = [None] + [p["cp"] for p in proximas]
@@ -901,216 +1125,11 @@ def painel_principal():
 
     paradas_ativas = [mapa_cp_parada[cp_selecionado]] if cp_selecionado in mapa_cp_parada else proximas
 
-    # ---------------- 4. CONSOLIDAÇÃO DAS LINHAS + PREVISÃO HÍBRIDA (API + GPS) ----------------
-    melhor_parada_por_linha = {}
-    for p in paradas_ativas:
-        for chave in p["linhas"]:
-            if dest_pos and chave not in linhas_destino_map:
-                continue
-            melhor_parada_por_linha.setdefault(chave, p)
-
-    # 4.1) Tenta buscar via API PrevisaoParada (rápido para corredores)
-    etas_oficiais = {}  # (cp, letreiro_norm, sl) -> lista de minutos
-    etas_base = {}      # (cp, base_num, sl) -> lista de minutos
-    try:
-        for p in paradas_ativas[:6]:
-            hr, ls = previsao_da_parada(p["cp"])
-            for l in ls:
-                vs = sorted(l.get("vs") or [], key=lambda v: v["t"])
-                if hr and vs:
-                    mins_l = [minutos_ate(hr, v["t"]) for v in vs]
-                    c_norm = norm_letreiro(l.get("c"))
-                    c_base = letreiro_base(c_norm)
-                    sl_l = l.get("sl")
-                    etas_oficiais[(p["cp"], c_norm, sl_l)] = mins_l
-                    etas_base[(p["cp"], c_base, sl_l)] = mins_l
-    except SPTransError:
-        pass
-
-    # 4.2) Para as linhas visíveis que estão em paradas de rua comuns (sem retorno na PrevisaoParada),
-    #      consulta a frota ao vivo da linha para nunca deixar a tela principal sem previsão!
-    dados_linhas = {}  # (rota, direcao) -> {"mins": list, "estimado": bool, "vs": list}
-    candidatas = list(melhor_parada_por_linha.items())
-
-    # Se tiver filtro de destino, ordena primeiro pelas que deixam MAIS PERTO do endereço pesquisado!
-    if dest_pos:
-        candidatas.sort(key=lambda kv: (linhas_destino_map[kv[0]]["dist_m"], kv[1]["dist_m"]))
-    else:
-        candidatas.sort(key=lambda kv: (kv[1]["dist_m"], kv[0][0]))
-
-    for (rota, direcao), p in candidatas[:12]:
-        sl = 2 - direcao
-        r_norm = norm_letreiro(rota)
-        r_base = letreiro_base(rota)
-        mins = etas_oficiais.get((p["cp"], r_norm, sl)) or etas_base.get((p["cp"], r_base, sl))
-        if mins:
-            dados_linhas[(rota, direcao)] = {"mins": mins, "estimado": False, "vs": []}
-        else:
-            mins_est, vs_linha, _ = obter_dados_tempo_real_linha(rota, sl, p["lat"], p["lon"])
-            dados_linhas[(rota, direcao)] = {"mins": mins_est, "estimado": True, "vs": vs_linha}
-
-    # ---------------- 5. MAPA INTELIGENTE (MOSTRA PARADAS OU A ROTA DO ÔNIBUS CLICADO) ----------------
-    linha_ativa_mapa = st.session_state.get("linha_mapa")
-    # Verifica se a linha selecionada ainda pertence à lista atual
-    if linha_ativa_mapa and (linha_ativa_mapa[0], linha_ativa_mapa[1]) not in melhor_parada_por_linha:
-        linha_ativa_mapa = None
-        st.session_state["linha_mapa"] = None
-
-    mapa = mapa_base(user_pos)
-    foco_mapa = [user_pos]
-
-    if linha_ativa_mapa:
-        # MODO ROTA DO ÔNIBUS SELECIONADO: Desenha o trajeto completo, os ônibus ao vivo, embarque e desembarque!
-        rota_sel, dir_sel, _ = linha_ativa_mapa
-        sl_sel = 2 - dir_sel
-        cor_sel = cor_da_linha(rota_sel)
-        dest_str = G["destino"].get((rota_sel, dir_sel), "")
-        p_emb = melhor_parada_por_linha[(rota_sel, dir_sel)]
-
-        trajeto = gtfs_data.trajeto_da_linha(G, rota_sel, sl_sel, dest_str)
-        if trajeto:
-            desenhar_trajeto(mapa, trajeto, cor_sel)
-
-        # Marca a parada de embarque (verde/laranja)
-        folium.Marker(
-            (p_emb["lat"], p_emb["lon"]),
-            icon=icone_parada(cor_bg="#059669"),
-            tooltip=f"🟢 Embarque: {p_emb['nome']} ({dist_txt(p_emb['dist_m'])} de você)",
-        ).add_to(mapa)
-        folium.PolyLine([user_pos, (p_emb["lat"], p_emb["lon"])], color="#2563EB", weight=3, dash_array="4 6").add_to(mapa)
-        foco_mapa.append((p_emb["lat"], p_emb["lon"]))
-
-        # Se tiver endereço pesquisado, destaca a parada de desembarque mais próxima do destino!
-        if dest_pos and (rota_sel, dir_sel) in linhas_destino_map:
-            p_desc = linhas_destino_map[(rota_sel, dir_sel)]
-            folium.Marker(
-                (p_desc["lat"], p_desc["lon"]),
-                icon=icone_parada(cor_bg="#0F172A"),
-                tooltip=f"🏁 Descer em: {p_desc['nome']} ({dist_txt(p_desc['dist_m'])} do destino)",
-            ).add_to(mapa)
-            folium.PolyLine([dest_pos, (p_desc["lat"], p_desc["lon"])], color="#EF4444", weight=3, dash_array="4 6").add_to(mapa)
-            foco_mapa.extend([dest_pos, (p_desc["lat"], p_desc["lon"])])
-
-        # Plota os ônibus ao vivo dessa linha no mapa
-        info_rt = dados_linhas.get((rota_sel, dir_sel)) or {}
-        vs_ativos = info_rt.get("vs")
-        if not vs_ativos:
-            _, vs_ativos, _ = obter_dados_tempo_real_linha(rota_sel, sl_sel, p_emb["lat"], p_emb["lon"])
-        for v in (vs_ativos or []):
-            folium.Marker(
-                (v["py"], v["px"]),
-                icon=icone_onibus(cor_sel),
-                tooltip=f"🚌 Linha {rota_sel} • Prefixo {v['p']} ({hora_local(v.get('ta'))})",
-            ).add_to(mapa)
-            if not dest_pos:
-                foco_mapa.append((v["py"], v["px"]))
-
-        if not dest_pos and trajeto:
-            foco_mapa.extend(trajeto[::max(1, len(trajeto) // 10)])
-    else:
-        # MODO RADAR PADRÃO: Mostra seu raio e paradas próximas
-        folium.Circle(user_pos, radius=raio_atual, color=COR_MARCA, weight=1.5, fill=True, fill_opacity=0.06, dash_array="6").add_to(mapa)
-        for p in proximas:
-            selecionada = (cp_selecionado == p["cp"])
-            if selecionada or len(proximas) <= 5:
-                folium.Marker(
-                    (p["lat"], p["lon"]),
-                    icon=icone_parada(cor_bg="#0F172A" if selecionada else COR_MARCA),
-                    tooltip=f"{p['nome']} ({dist_txt(p['dist_m'])})",
-                ).add_to(mapa)
-            else:
-                folium.CircleMarker(
-                    (p["lat"], p["lon"]), radius=7, color="#fff", weight=2,
-                    fill=True, fill_color=COR_MARCA, fill_opacity=1,
-                    tooltip=f"{p['nome']} ({dist_txt(p['dist_m'])})",
-                ).add_to(mapa)
-            if cp_selecionado is None or selecionada:
-                foco_mapa.append((p["lat"], p["lon"]))
-
-    folium.Marker(user_pos, icon=icone_usuario(), tooltip="Você está aqui").add_to(mapa)
-    if dest_pos:
-        folium.Marker(dest_pos, icon=icone_destino(), tooltip=f"Destino: {dest_nome}").add_to(mapa)
-        foco_mapa.append(dest_pos)
-
-    # Barra de status do mapa caso uma linha esteja desenhada nele
-    if linha_ativa_mapa:
-        c_m1, c_m2 = st.columns([4.0, 1.4], vertical_alignment="center")
-        with c_m1:
-            st.caption(f"🗺️ Exibindo no mapa o trajeto e frota da linha **{linha_ativa_mapa[0]}**")
-        with c_m2:
-            if st.button("✖ Ocultar rota", use_container_width=True):
-                st.session_state["linha_mapa"] = None
-                st.rerun()
-
-    desenhar_mapa(
-        mapa, foco_mapa,
-        key=f"mapa_principal_{cp_selecionado}_{raio_atual}_{bool(dest_pos)}_{linha_ativa_mapa}",
-        altura=330,
+    # ---------------- 4. CHAMA O FRAGMENTO INDEPENDENTE (MAPA + LISTA DE ÔNIBUS) ----------------
+    bloco_tempo_real(
+        G, proximas, paradas_ativas, mapa_cp_parada,
+        cp_selecionado, dest_pos, dest_nome, linhas_destino_map
     )
-
-    # ---------------- 6. ORDENAÇÃO E CARDS INTERATIVOS DAS LINHAS ----------------
-    def _ordem_final(item):
-        (rota, direcao), p = item
-        info = dados_linhas.get((rota, direcao)) or {}
-        mins = info.get("mins") or []
-        eta_p = mins[0] if mins else 999
-        # Se pesquisou endereço, prioriza o ônibus que passa MAIS PERTO do destino!
-        if dest_pos and (rota, direcao) in linhas_destino_map:
-            dist_dest = linhas_destino_map[(rota, direcao)]["dist_m"]
-            return (0 if mins else 1, dist_dest, eta_p, p["dist_m"])
-        return (eta_p, p["dist_m"], rota)
-
-    linhas_ordenadas = sorted(candidatas, key=_ordem_final)
-
-    titulo_sec = (
-        f"🚌 Ônibus para {dest_nome} ({len(linhas_ordenadas)})"
-        if dest_pos
-        else f"🚌 Ônibus em {mapa_cp_parada[cp_selecionado]['nome']}"
-        if cp_selecionado in mapa_cp_parada
-        else f"🚌 Linhas próximas ({len(linhas_ordenadas)})"
-    )
-    st.markdown(f'<div class="sec"><span>{h(titulo_sec)}</span><span>Previsão</span></div>', unsafe_allow_html=True)
-
-    for (rota, direcao), p in linhas_ordenadas[:15]:
-        info = dados_linhas.get((rota, direcao)) or {}
-        mins = info.get("mins") or []
-        estimado = info.get("estimado", False)
-        eta_html = texto_eta(mins[0], mins[1:], estimado=estimado) if mins else texto_eta(None)
-        destino_letreiro = h(G["destino"].get((rota, direcao), "Terminal"))
-
-        esta_no_mapa = bool(linha_ativa_mapa and linha_ativa_mapa[0] == rota and linha_ativa_mapa[1] == direcao)
-        cls_selecionado = "selected" if esta_no_mapa else ""
-
-        info_desembarque = ""
-        if dest_pos and (rota, direcao) in linhas_destino_map:
-            p_desc = linhas_destino_map[(rota, direcao)]
-            info_desembarque = (
-                f'<div class="card-sub" style="margin-top:4px;color:#059669">'
-                f'🏁 <b>Descer a {dist_txt(p_desc["dist_m"])} do destino:</b> {h(p_desc["nome"])}</div>'
-            )
-
-        status_live = '<span class="live"></span>' if mins else ""
-        col_card, col_btn = st.columns([4.5, 1.3], vertical_alignment="center")
-        with col_card:
-            card(
-                f'<div class="card compact interactive {cls_selecionado}"><div class="row"><div>'
-                f'{badge(rota)}<span class="card-title" style="font-size:0.91rem">➜ {destino_letreiro}</span>'
-                f'<div class="card-sub" style="margin-top:5px">{status_live}🟢 <b>Embarque ({dist_txt(p["dist_m"])}):</b> {h(p["nome"])}</div>'
-                f'{info_desembarque}'
-                f'</div>{eta_html}</div></div>'
-            )
-        with col_btn:
-            rotulo_btn = "✅ No mapa" if esta_no_mapa else "👁️ Ver rota"
-            tipo_btn = "primary" if esta_no_mapa else "secondary"
-            st.button(
-                rotulo_btn,
-                key=f"btn_rota_{rota}_{direcao}_{p['cp']}",
-                on_click=alternar_linha_no_mapa,
-                args=(rota, direcao, p["cp"]),
-                type=tipo_btn,
-                help="Desenha a rota deste ônibus no mapa acima para ver onde ele passa",
-                use_container_width=True,
-            )
 
 
 painel_principal()
